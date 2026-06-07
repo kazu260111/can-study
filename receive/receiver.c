@@ -74,10 +74,10 @@ int main() {
 	memcpy(&data, frame.data, sizeof(data));
 	fprintf(stderr, "[D] 受け取ったデータを表示します\n");
 	/* 受け取ったデータの表示開始 */
-	printf("温度: %d\n"
-	       "湿度: %u\n"
-	       "気圧: %u\n"
-	       "送信時刻: %u\n",
+	printf("温度: %d °C\n"
+	       "湿度: %u %%\n"
+	       "気圧: %u hPa\n"
+	       "送信時刻: %u ms\n",
 	       data.temperature,
 	       data.humidity,
 	       data.pressure,
