@@ -6,13 +6,228 @@
   - 著者: Michael Kerrisk
   - 訳者: 千住　治郎
   - 出版社: オライリー・ジャパン
-本文中ではTLPIと表記
+  - 本文中ではTLPIと表記
 
 
 # 参考資料
 [SocketCAN - Controller Area Network(Linuxカーネル)](https://docs.kernel.org/networking/can.html)
 
 # 学習メモ
+## 第2回 受信テスト 2026-06-07
+### 学習内容
+#### 基本コマンドの確認
+基本のコマンドからまとめる。
+- ネットワークインターフェースの確認
+```bash
+$ ip link show 
+```
+- 仮想CANインターフェースのカーネルモジュールをロード
+```bash
+$ sudo modprobe vcan
+```
+- ネットワークインターフェースの追加
+```bash
+$ sudo ip link add dev [インターフェース名(vcan0)] type [種別(vcan)]
+```
+- ネットワークインターフェースの削除
+```bash
+$ sudo ip link delete [インターフェース名(vcan0)]
+```
+- インターフェースのup/down
+```bash
+$ sudo ip link set [インターフェース名(van0)] [up|down]
+```
+
+#### 仮想CANインターフェースの作成
+```bash
+$ sudo modprobe vcan
+$ sudo ip link add dev vcan0 type vcan
+$ ip link show vcan0
+3: vcan0: <NOARP> mtu 2060 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/can 
+$ sudo ip link set vcan0 up
+$ ip link show vcan0
+3: vcan0: <NOARP,UP,LOWER_UP> mtu 2060 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/can 
+```
+- これで仮想インターフェースは作成したので、candumpでテストする。
+
+- 端末1で以下のコマンドを実行した
+```bash
+# 端末1で実行
+$ candump vcan0  # 待機状態になる
+```
+- 次に、端末2で以下のコマンドを実行した
+```bash
+# 端末2で実行
+$ cansend vcan0 123#1234ABCD
+```
+- その後、待機状態の端末1の画面は以下のような表示になった
+```text
+# 端末1の表示
+$ candump vcan0
+  vcan0  123   [4]  12 34 AB CD
+```
+- これで仮想インターフェースが機能していることが確認できた。
+
+#### RAWフレームの受信プログラムの作成
+- 以下は受け渡すデータ用のヘッダファイル(util.h)
+```c
+#ifndef UTIL_H
+#define UTIL_H
+#include <stdint.h>
+/* フレームのペイロードで運ぶデータ(8byte、リトルエンディアン) */
+struct sensor_data {
+	int8_t temperature;  /* 温度[°C] (1byte) */
+	uint8_t humidity;  /* 湿度[%] (1byte) */
+	uint16_t pressure;  /* 気圧[hPa] (2byte) */
+	uint32_t timestamp;  /* 送信時刻[ms] (4byte)*/
+};
+
+#endif
+```
+- 以下は受信側のプログラム(receive.c)
+```c
+/*
+ * 生の仮想CANフレームを受信するプログラム
+ * 
+ * ソケットを開けてから受信までの処理はほぼ学習メモ第1回の内容通り。
+ * それに加えて読んだフレームを独自の構造体にキャストして意味のあるデータとして
+ * 解釈できるようにする。今回は単純化のため一つのフレームで一つのデータとして
+ * 成立するようにする。(8バイトで収まるデータにして、複数フレームからの組み立ては不要にする)
+ * データのバイトオーダーはすべてリトルエンディアンで統一する。
+ */
+
+#include <linux/can.h>
+#include <linux/sockios.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <string.h>
+#include <unistd.h>
+#include "../util.h"
+#include <stdint.h>
+
+int main() {
+	/*>>> ソケットを開けてから受信までの処理 <<<*/
+	/* ソケットをオープンする */
+	fprintf(stderr, "[D] 受信プログラムの開始、socket()を実行\n");
+	int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s == -1) {
+		fprintf(stderr, "[E] socket()失敗: %s\n", strerror(errno));
+		return 1;
+	}
+	/* インターフェースのインデックス番号を調べる準備 */
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, "vcan0");
+	/* インデックス番号を解決し、ifr.ifr_indexに調べた番号を入れる */
+	if (ioctl(s, SIOCGIFINDEX, &ifr) == -1) {
+		fprintf(stderr, "[E] ioctl()でインデックス番号の解決に失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	
+	/* sockaddr_canの設定 */
+	struct sockaddr_can addr;
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifr.ifr_ifindex;
+
+	/* bind()の実行 */
+	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "[E] bind()失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	/* read()の実行 */
+	struct can_frame frame;
+	ssize_t num_read = read(s, &frame, sizeof(struct can_frame));
+	/* read()で読み取れなかったとき */
+	if (num_read < 0) {
+		fprintf(stderr, "[E] read()でフレームを読み取れませんでした: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	/* 規定の16byteを読み取れないとき */
+	if (num_read < (ssize_t)sizeof(struct can_frame)) {
+	       fprintf(stderr, "[E] 読み取れたフレームが規定(16バイト)より少ないです \n");
+	       close(s);
+	       return 1;
+ 	}
+	fprintf(stderr, "[D] フレームの読み取りが完了しました\n");	
+
+	/*>>> フレームの解釈とデータ表示 <<<*/
+	fprintf(stderr, "[D] フレームの解釈を開始します\n");
+	struct sensor_data data;
+	/* フレームのペイロードをsensor_data型の変数に入れる */
+	memcpy(&data, frame.data, sizeof(data));
+	fprintf(stderr, "[D] 受け取ったデータを表示します\n");
+	/* 受け取ったデータの表示開始 */
+	printf("温度: %d\n"
+	       "湿度: %u\n"
+	       "気圧: %u\n"
+	       "送信時刻: %u\n",
+	       data.temperature,
+	       data.humidity,
+	       data.pressure,
+	       data.timestamp);
+
+	/*>>> 終了処理 <<<*/
+	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
+	close(s);
+	return 0;
+}
+```
+- 送信側については今回はcansendで代用する。(次回送信側のプログラムを作成)
+cansendで送るテストデータを以下のように決めた。
+- リトルエンディアンで送ることにしたので、バイトの並び順に注意する必要がある。
+```text
+データの種類    10進数表示  16進数表示  実際に送るバイト列
+温度(1byte)     25          19          19
+湿度(1byte)     50          32          32
+気圧(2byte)     1013        03F5        F5 03
+送信時刻(4byte) 305441741   1234ABCD    CD AB 34 12
+```
+この場合、以下のようにすればデータを送信できる。
+```bash
+$ cansend vcan0 123#1932F503CDAB3412
+```
+
+#### 実行結果
+仮想インターフェース(vcan0)を作成した状態で受信側のプログラムを起動したあと、別端末でcansendを実行する。
+
+- まず端末1で受信側のプログラムを実行する
+```bash
+# 端末1
+$ ./build/receiver
+[D] 受信プログラムの開始、socket()を実行
+```
+- 次に端末2から以下のようにcansendを実行する
+```bash
+# 端末2
+$ cansend vcan0 123#1932F503CDAB3412
+```
+- その後、端末1の画面が以下のようになった。
+```text
+# 端末1の画面
+$ ./build/receiver
+[D] 受信プログラムの開始、socket()を実行
+# 以下は受信後に表示
+[D] フレームの読み取りが完了しました
+[D] フレームの解釈を開始します
+[D] 受け取ったデータを表示します
+温度: 25
+湿度: 50
+気圧: 1013
+送信時刻: 305441741
+[D] ソケットを閉じて終了します
+```
+### 感想
+- バイトオーダー順は間違えると異常データになるので仕様をよくチェックするよう心がけたい。
+- TCP/IPの実装でフレーム・パケットのやりとりを理解していたのでスムーズに理解できた。
+- 受け取ったデータの表示に単位をつけるのを忘れていたので、次回までに改善する予定。
+
 ## 第1回 CANの基礎理解 2026-06-06
 ### 学習内容
 - 以下のコマンドで必要ツールをインストールした。
