@@ -13,8 +13,138 @@
 [SocketCAN - Controller Area Network(Linuxカーネル)](https://docs.kernel.org/networking/can.html)
 
 # 学習メモ
+## 第3回 送信テスト 2026-06-08
+### 学習内容
+- 送信プログラムの作成
+- 送信・受信プログラムのテスト
+
+#### 送信プログラムの作成
+前回はcansendで代替したが、今回は送信プログラムを自作する。
+以下のようなプログラムを作成した。(send.c)
+```c
+/*
+ * 生の仮想CANフレームを送信するプログラム
+ * 
+ * ソケットを開けてからbind()までの処理は受信側と同じ。
+ * その後送信用のフレームを組み立ててwrite()で送信する。
+ * データのバイトオーダーはすべてリトルエンディアンで統一する。
+ */
+
+#include <linux/can.h>
+#include <linux/sockios.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <string.h>
+#include <unistd.h>
+#include "../util.h"
+#include <stdint.h>
+
+int main() {
+	/*>>> ソケットを開けてからbind()までの処理 <<<*/
+	/* ソケットをオープンする */
+	fprintf(stderr, "[D] 送信プログラムの開始、socket()を実行\n");
+	int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s == -1) {
+		fprintf(stderr, "[E] socket()失敗: %s\n", strerror(errno));
+		return 1;
+	}
+	/* インターフェースのインデックス番号を調べる準備 */
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, "vcan0");
+	/* インデックス番号を解決し、ifr.ifr_indexに調べた番号を入れる */
+	if (ioctl(s, SIOCGIFINDEX, &ifr) == -1) {
+		fprintf(stderr, "[E] ioctl()でインデックス番号の解決に失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	
+	/* sockaddr_canの設定 */
+	struct sockaddr_can addr;
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifr.ifr_ifindex;
+
+	/* bind()の実行 */
+	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "[E] bind()失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+
+	/*>>> フレームの組み立て <<<*/ 
+	/* 0で初期化(使わない領域を確実に0で埋めておく) */
+	struct can_frame frame = {0};
+	/* can_idの設定 */
+	frame.can_id = 0x123;
+	/* データの長さの設定 */
+	frame.len = sizeof(struct sensor_data);
+	/* ペイロードに入れるデータの設定 */
+	/* ホストがリトルエンディアンなのでこのまま設定してよい */
+	struct sensor_data data;
+	data.temperature = 25;  /* 1byte */
+	data.humidity = 50;  /* 1byte */
+	data.pressure = 1013;  /* 2byte */
+	data.timestamp = 0x1234ABCD;  /* 4byte */
+	/* frameにデータを入れる */
+	/* リトルエンディアンで統一されていて、構造体にパディングもないのでこのままmemcpy()でよい */
+	memcpy(frame.data, &data, sizeof(data));
+
+	/*>>> フレームの送信 <<<*/
+	ssize_t num_write = write(s, &frame, sizeof(struct can_frame));
+	if (num_write == -1) {
+		fprintf(stderr, "[E] write()に失敗しました: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	if (num_write < (ssize_t)sizeof(struct can_frame)) {
+		fprintf(stderr, "[E] 送信したフレームのバイト数が規定より少ないです: %zdバイト\n", num_write);
+		close(s);
+		return 1;
+	}
+	/*>>> 終了処理 <<<*/
+	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
+	close(s);
+	return 0;
+}
+```
+
+#### 実行結果
+前回と同様にネットワークインターフェースを作成した後に端末1、端末2でそれぞれ受信・送信プログラムを実行する。
+
+- 端末1で受信プログラムを実行した後、端末2で送信プログラムを実行すると以下のように表示された。
+```bash
+# 端末2(送信側)
+$ ./send
+[D] 送信プログラムの開始、socket()を実行
+[D] ソケットを閉じて終了します
+```
+- 端末2からの送信後、受信側の端末1の画面は以下のようになった。
+```bash
+# 端末1(受信側)の画面
+$ ./build/receiver 
+[D] 受信プログラムの開始、socket()を実行
+# 以下は端末1で送信実行後に表示
+[D] フレームの読み取りが完了しました
+[D] フレームの解釈を開始します
+[D] 受け取ったデータを表示します
+温度: 25 °C
+湿度: 50 %
+気圧: 1013 hPa
+送信時刻: 305441741 ms
+```
+
+### 感想
+- 受信プログラムとほぼ同じだったので後半のフレーム組み立てだけ注意して取り組んだ。
+  - 特にバイトオーダーとパディングに気をつけたい。今後はエンディアンを調整する関数も
+    使って移植性なども意識していきたい。
+
 ## 第2回 受信テスト 2026-06-07
 ### 学習内容
+- ネットワークインターフェース関連の基本コマンドの確認
+- 受信側のプログラムの作成
+
 #### 基本コマンドの確認
 基本のコマンドからまとめる。
 - ネットワークインターフェースの確認
@@ -63,7 +193,7 @@ $ candump vcan0  # 待機状態になる
 $ cansend vcan0 123#1234ABCD
 ```
 - その後、待機状態の端末1の画面は以下のような表示になった
-```text
+```bash
 # 端末1の表示
 $ candump vcan0
   vcan0  123   [4]  12 34 AB CD
@@ -209,7 +339,7 @@ $ ./build/receiver
 $ cansend vcan0 123#1932F503CDAB3412
 ```
 - その後、端末1の画面が以下のようになった。
-```text
+```bash
 # 端末1の画面
 $ ./build/receiver
 [D] 受信プログラムの開始、socket()を実行
