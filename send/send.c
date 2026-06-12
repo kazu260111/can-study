@@ -17,6 +17,33 @@
 #include <unistd.h>
 #include "../util.h"
 #include <stdint.h>
+#define ERROR_WRITE 2
+#define ERROR_BYTE_COUNT 3
+void error_print(int err_num, ssize_t num_write) {
+	if (err_num == ERROR_WRITE) {
+		fprintf(stderr, "[E] write()に失敗しました: %s\n", strerror(errno));
+	}
+	else if (err_num == ERROR_BYTE_COUNT) {
+		fprintf(stderr, "[E] 送信したフレームのバイト数が規定より少ないです: %zdバイト\n", num_write);
+	}
+	else {
+		fprintf(stderr, "[E] 不明なエラーが発生しました\n");
+	}
+	return;
+}
+int send_frame(int s, struct can_frame *ptr_frame) {
+	ssize_t num_write;
+	num_write = write(s, ptr_frame, sizeof(struct can_frame));
+	if (num_write == -1) {
+		error_print(ERROR_WRITE, 0);
+		return 1;
+	}
+	if (num_write < (ssize_t)sizeof(struct can_frame)) {
+		error_print(ERROR_BYTE_COUNT, num_write);
+		return 1;
+	}
+	return 0;
+}
 
 int main() {
 	/*>>> ソケットを開けてからbind()までの処理 <<<*/
@@ -49,7 +76,8 @@ int main() {
 		return 1;
 	}
 
-	/*>>> フレームの組み立て <<<*/ 
+	/*>>> 1番目のフレーム(受信させる) <<<*/
+	fprintf(stderr, "[D] 1番目のフレーム(受信予定)を送る準備をします\n");
 	/* 0で初期化(使わない領域を確実に0で埋めておく) */
 	struct can_frame frame = {0};
 	/* can_idの設定 */
@@ -68,17 +96,60 @@ int main() {
 	memcpy(frame.data, &data, sizeof(data));
 
 	/*>>> フレームの送信 <<<*/
-	ssize_t num_write = write(s, &frame, sizeof(struct can_frame));
-	if (num_write == -1) {
-		fprintf(stderr, "[E] write()に失敗しました: %s\n", strerror(errno));
+	int rt = send_frame(s, &frame);
+	if (rt == 1) {
 		close(s);
 		return 1;
 	}
-	if (num_write < (ssize_t)sizeof(struct can_frame)) {
-		fprintf(stderr, "[E] 送信したフレームのバイト数が規定より少ないです: %zdバイト\n", num_write);
+	fprintf(stderr, "[D] 1番目のフレーム(受信予定)を送りました\n");
+	
+	/*>>> 2番目のフレーム(受信させない) <<<*/
+	fprintf(stderr, "[D] 2番目のフレーム(受信させない)を送る準備をします\n");
+	/* 0でリセット*/
+	memset(&frame, 0, sizeof(struct can_frame));
+	/*=== can_idの設定(別のcan id) ===*/
+	frame.can_id = 0x456;
+	/* データの長さの設定 */
+	frame.len = sizeof(struct sensor_data);
+	/* ペイロードに入れるデータの設定 */
+	data.temperature = 10;  /* 1byte */
+	data.humidity = 10;  /* 1byte */
+	data.pressure = 1000;  /* 2byte */
+	data.timestamp = 0x1;  /* 4byte */
+	/* frameにデータを入れる */
+	memcpy(frame.data, &data, sizeof(data));
+	/*>>> フレームの送信 <<<*/
+	rt = send_frame(s, &frame);
+	if (rt == 1) {
 		close(s);
 		return 1;
 	}
+	fprintf(stderr, "[D] 2番目のフレーム(受信させない)を送りました\n");
+
+	/*>>> 3番目のフレーム(受信させない) <<<*/
+	fprintf(stderr, "[D] 3番目のフレーム(受信させない)を送る準備をします\n");
+	/* 0でリセット*/
+	memset(&frame, 0, sizeof(struct can_frame));
+	/*=== can_idの設定(拡張フォーマット) ===*/
+	frame.can_id = 0x123 | CAN_EFF_FLAG;
+
+	/* データの長さの設定 */
+	frame.len = sizeof(struct sensor_data);
+	/* ペイロードに入れるデータの設定 */
+	data.temperature = 10;  /* 1byte */
+	data.humidity = 10;  /* 1byte */
+	data.pressure = 1000;  /* 2byte */
+	data.timestamp = 0x1;  /* 4byte */
+	/* frameにデータを入れる */
+	memcpy(frame.data, &data, sizeof(data));
+	/*>>> フレームの送信 <<<*/
+	rt = send_frame(s, &frame);
+	if (rt == 1) {
+		close(s);
+		return 1;
+	}
+	fprintf(stderr, "[D] 3番目のフレーム(受信させない)を送りました\n");
+
 	/*>>> 終了処理 <<<*/
 	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
 	close(s);
