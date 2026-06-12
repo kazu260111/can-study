@@ -13,6 +13,395 @@
 [SocketCAN - Controller Area Network(Linuxカーネル)](https://docs.kernel.org/networking/can.html)
 
 # 学習メモ
+## 第4回 フィルタリングの実装
+### 学習内容
+[SocketCAN - Controller Area Network(Linuxカーネル)](https://docs.kernel.org/networking/can.html)の"RAW Protocol Sockets with can_filters (SOCK_RAW)"から引用・参考にした。
+- 生のパケットを受信するときにフィルタリング機能を追加してcan_idの異なるフレームは受け取らないようにする
+
+#### フィルタリングの仕組み
+RAWパケットを受信するときはデフォルトでいくつかの設定がされる。
+- すべてのパケットを受信する
+- エラーメッセージは受け取らない
+- ループバックは有効だが、他のソケットが受け取れる(自身は受け取れない)
+
+今回は設定を変更してパケットをフィルタリングして特定のcan_idのものだけ受信できるようにする。
+フィルターを設定するためには以下の構造体を使う。
+
+```c
+struct can_filter {
+    canid_t can_id;
+    canid_t can_mask;
+};
+```
+can_idとcan_maskのビット論理積によってパケットを受け入れるかが決まる。
+式で表すと以下を満たせば良い。
+```text
+([受信フレームのcan_id] & can_mask) == (can_id & can_mask)
+```
+言い換えると、can_maskは受信フレームのcan_idに対してフィルタ側のcan_idのビットがどれだけ一致していればよいかを示している。
+
+can_maskについて理解するために定義されたmaskとcanid_tの仕様を確認する。(linux/can.h)
+```c
+/* special address description flags for the CAN_ID */
+#define CAN_EFF_FLAG 0x80000000U /* EFF/SFF is set in the MSB */
+#define CAN_RTR_FLAG 0x40000000U /* remote transmission request */
+#define CAN_ERR_FLAG 0x20000000U /* error message frame */
+
+/* valid bits in CAN ID for frame formats */
+#define CAN_SFF_MASK 0x000007FFU /* standard frame format (SFF) */
+#define CAN_EFF_MASK 0x1FFFFFFFU /* extended frame format (EFF) */
+#define CAN_ERR_MASK 0x1FFFFFFFU /* omit EFF, RTR, ERR flags */
+#define CANXL_PRIO_MASK CAN_SFF_MASK /* 11 bit priority mask */
+
+/*
+ * Controller Area Network Identifier structure
+ *
+ * bit 0-28	: CAN identifier (11/29 bit)
+ * bit 29	: error message frame flag (0 = data frame, 1 = error message)
+ * bit 30	: remote transmission request flag (1 = rtr frame)
+ * bit 31	: frame format flag (0 = standard 11 bit, 1 = extended 29 bit)
+ */
+typedef __u32 canid_t;
+```
+ヘッダファイルから以下のことがわかる。
+- 上位ビットはフレームフォーマットフラグ(エラーメッセージ、リモート、標準または拡張のフラグ)
+- 下位11bit(拡張なら29bit)がcan id用に設定されている
+
+今回標準フォーマットでcan idが一致すれば受信すると決めた場合、maskは下位11bitと上位1bitに1を設定すればよい。
+また、リモートフレームの処理は実装してないので受け取らないようにbit 30(下位から数えて31bit目)も判定する必要があるので以下のようにmaskを設定する。
+```text
+mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;
+```
+エラーメッセージのフラグは設定不要(デフォルトで受け取らないので設定しないと来ない)
+
+今回はフィルターは一つで実験するが、複数設定することも可能(どれかが条件を満たせば受信できる)。
+例えば2つフィルターを設定するときは以下のように定義する。
+```c
+struct can_filter rfilter[2];
+```
+
+フィルタを実際に設定するときは以下のようにする(bind()の前後で可能)。
+```c
+/* CAN_RAW_FILTERに <linux/can/raw.h> が必要 */
+setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter)); 
+```
+
+#### 受信プログラムの変更
+既存のreceiver.cを変更してフィルタを設定する。
+```c
+/*
+ * 生の仮想CANフレームを受信するプログラム
+ *
+ * 更新履歴:
+ * 第4回 フィルタを設定するコードを追加、複数フレームをループで受信するがctrl+cで強制終了する必要がある
+ * 
+ * ソケットを開けてから受信までの処理はほぼ学習メモ第1回の内容通り。
+ * それに加えて読んだフレームを独自の構造体にキャストして意味のあるデータとして
+ * 解釈できるようにする。今回は単純化のため一つのフレームで一つのデータとして
+ * 成立するようにする。(8バイトで収まるデータにして、複数フレームからの組み立ては不要にする)
+ * データのバイトオーダーはすべてリトルエンディアンで統一する。
+ */
+
+#include <linux/can.h>
+#include <linux/can/raw.h> 
+#include <linux/sockios.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <string.h>
+#include <unistd.h>
+#include "../util.h"
+#include <stdint.h>
+
+int main() {
+	/*>>> ソケットを開けてから受信までの処理 <<<*/
+	/* ソケットをオープンする */
+	fprintf(stderr, "[D] 受信プログラムの開始、socket()を実行\n");
+	int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s == -1) {
+		fprintf(stderr, "[E] socket()失敗: %s\n", strerror(errno));
+		return 1;
+	}
+	/* インターフェースのインデックス番号を調べる準備 */
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, "vcan0");
+	/* インデックス番号を解決し、ifr.ifr_indexに調べた番号を入れる */
+	if (ioctl(s, SIOCGIFINDEX, &ifr) == -1) {
+		fprintf(stderr, "[E] ioctl()でインデックス番号の解決に失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	
+	/* sockaddr_canの設定 */
+	struct sockaddr_can addr;
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifr.ifr_ifindex;
+
+	/* bind()の実行 */
+	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "[E] bind()失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	/* フィルタの設定 */
+	struct can_filter rfilter;
+	rfilter.can_id = 0x123;
+	rfilter.can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;	/* 標準フレームのみ通すようにに設定 */
+	/* フィルタ設定の実行 */
+	if (setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter)) == -1) {
+		fprintf(stderr, "setsockopt()に失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+		
+	/*>>> 受信(エラーにならない限りループ) <<<*/
+	while (1) {
+		/* read()の実行 */
+		struct can_frame frame;
+		ssize_t num_read = read(s, &frame, sizeof(struct can_frame));
+		/* read()で読み取れなかったとき */
+		if (num_read < 0) {
+			fprintf(stderr, "[E] read()でフレームを読み取れませんでした: %s\n", strerror(errno));
+			close(s);
+			return 1;
+		}
+		/* 規定の16byteを読み取れないとき */
+		if (num_read < (ssize_t)sizeof(struct can_frame)) {
+		       fprintf(stderr, "[E] 読み取れたフレームが規定(16バイト)より少ないです \n");
+		       close(s);
+		       return 1;
+	 	}
+		fprintf(stderr, "[D] フレームの読み取りが完了しました\n");	
+	
+		/*>>> フレームの解釈とデータ表示 <<<*/
+		fprintf(stderr, "[D] フレームの解釈を開始します\n");
+		struct sensor_data data;
+		/* フレームのペイロードをsensor_data型の変数に入れる */
+		memcpy(&data, frame.data, sizeof(data));
+		fprintf(stderr, "[D] 受け取ったデータを表示します\n");
+		/* 受け取ったデータの表示開始 */
+		printf("温度: %d °C\n"
+		       "湿度: %u %%\n"
+		       "気圧: %u hPa\n"
+		       "送信時刻: %u ms\n",
+		       data.temperature,
+		       data.humidity,
+		       data.pressure,
+		       data.timestamp);
+	}
+
+	/*>>> 終了処理(到達しない) <<<*/
+	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
+	close(s);
+	return 0;
+}
+```
+
+#### 送信プログラムの変更
+既存のsend.cを変更して、複数のcan_idのフレームを送るようにする。
+```c
+/*
+ * 生の仮想CANフレームを送信するプログラム
+ * 
+ * ソケットを開けてからbind()までの処理は受信側と同じ。
+ * その後送信用のフレームを組み立ててwrite()で送信する。
+ * データのバイトオーダーはすべてリトルエンディアンで統一する。
+ */
+
+#include <linux/can.h>
+#include <linux/sockios.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <string.h>
+#include <unistd.h>
+#include "../util.h"
+#include <stdint.h>
+#define ERROR_WRITE 2
+#define ERROR_BYTE_COUNT 3
+
+void error_print(int err_num, ssize_t num_write) {
+	if (err_num == ERROR_WRITE) {
+		fprintf(stderr, "[E] write()に失敗しました: %s\n", strerror(errno));
+	}
+	else if (err_num == ERROR_BYTE_COUNT) {
+		fprintf(stderr, "[E] 送信したフレームのバイト数が規定より少ないです: %zdバイト\n", num_write);
+	}
+	else {
+		fprintf(stderr, "[E] 不明なエラーが発生しました\n");
+	}
+	return;
+}
+int send_frame(int s, struct can_frame *ptr_frame) {
+	ssize_t num_write;
+	num_write = write(s, ptr_frame, sizeof(struct can_frame));
+	if (num_write == -1) {
+		error_print(ERROR_WRITE, 0);
+		return 1;
+	}
+	if (num_write < (ssize_t)sizeof(struct can_frame)) {
+		error_print(ERROR_BYTE_COUNT, num_write);
+		return 1;
+	}
+	return 0;
+}
+int send_sensor_data(int s, canid_t can_id, struct sensor_data *ptr_data) {
+	struct can_frame frame = {0};
+	frame.can_id = can_id;
+	frame.len = sizeof(*ptr_data);
+	memcpy(frame.data, ptr_data, sizeof(*ptr_data));
+	return send_frame(s, &frame);
+}
+
+int main() {
+	/*>>> ソケットを開けてからbind()までの処理 <<<*/
+	/* ソケットをオープンする */
+	fprintf(stderr, "[D] 送信プログラムの開始、socket()を実行\n");
+	int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (s == -1) {
+		fprintf(stderr, "[E] socket()失敗: %s\n", strerror(errno));
+		return 1;
+	}
+	/* インターフェースのインデックス番号を調べる準備 */
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, "vcan0");
+	/* インデックス番号を解決し、ifr.ifr_indexに調べた番号を入れる */
+	if (ioctl(s, SIOCGIFINDEX, &ifr) == -1) {
+		fprintf(stderr, "[E] ioctl()でインデックス番号の解決に失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+	
+	/* sockaddr_canの設定 */
+	struct sockaddr_can addr;
+	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifr.ifr_ifindex;
+
+	/* bind()の実行 */
+	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "[E] bind()失敗: %s\n", strerror(errno));
+		close(s);
+		return 1;
+	}
+
+	/*>>> 1番目のフレーム(受信させる) <<<*/
+	fprintf(stderr, "[D] 1番目のフレーム(受信予定)を送る準備をします\n");
+	struct sensor_data data;
+	data.temperature = 10;  /* 1byte */
+	data.humidity = 10;  /* 1byte */
+	data.pressure = 1010;  /* 2byte */
+	data.timestamp = 0x1;  /* 4byte */
+	int rt = send_sensor_data(s, 0x123, &data); 
+	if (rt != 0) {
+		close(s);
+		return 1;
+	}
+	fprintf(stderr, "[D] 1番目のフレーム(受信予定)を送りました\n");
+	
+	/*>>> 2番目のフレーム(受信させない) <<<*/
+	fprintf(stderr, "[D] 2番目のフレーム(受信させない)を送る準備をします\n");
+	/* 0でリセット*/
+	memset(&data, 0, sizeof(data));
+	data.temperature = 20;  /* 1byte */
+	data.humidity = 20;  /* 1byte */
+	data.pressure = 1020;  /* 2byte */
+	data.timestamp = 0x2;  /* 4byte */
+	/* can idを変更(届かなくなるはず) */
+	rt = send_sensor_data(s, 0x456, &data); 
+	if (rt != 0) {
+		close(s);
+		return 1;
+	}
+	fprintf(stderr, "[D] 2番目のフレーム(受信させない)を送りました\n");
+
+	/*>>> 3番目のフレーム(受信させない) <<<*/
+	fprintf(stderr, "[D] 3番目のフレーム(受信させない)を送る準備をします\n");
+	/* 0でリセット*/
+	memset(&data, 0, sizeof(data));
+	data.temperature = 30;  /* 1byte */
+	data.humidity = 30;  /* 1byte */
+	data.pressure = 1030;  /* 2byte */
+	data.timestamp = 0x3;  /* 4byte */
+	/* 拡張フラグをセット(届かなくなるはず) */
+	rt = send_sensor_data(s, 0x123 | CAN_EFF_FLAG, &data); 
+	if (rt != 0) {
+		close(s);
+		return 1;
+	}
+	fprintf(stderr, "[D] 3番目のフレーム(受信させない)を送りました\n");
+
+	/*>>> 終了処理 <<<*/
+	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
+	close(s);
+	return 0;
+}
+```
+- フィルタ設定が成功していたら1番目の送信データは受信させ、2番目と3番目は受信しないように設定した。
+
+#### 実行結果
+前回と同じようにネットワークインターフェースを設定してから受信プログラムを実行した。
+その後、送信プログラムを**二回**実行した。
+
+- 端末1(受信側)
+```bash
+$ ./build/receiver 
+[D] 受信プログラムの開始、socket()を実行
+# 以下は一回目の送信プログラム実行後
+[D] フレームの読み取りが完了しました
+[D] フレームの解釈を開始します
+[D] 受け取ったデータを表示します
+温度: 10 °C
+湿度: 10 %
+気圧: 1010 hPa
+送信時刻: 1 ms
+# 以下は二回目の送信プログラム実行後
+[D] フレームの読み取りが完了しました
+[D] フレームの解釈を開始します
+[D] 受け取ったデータを表示します
+温度: 10 °C
+湿度: 10 %
+気圧: 1010 hPa
+送信時刻: 1 ms
+# Ctrl+cで強制終了
+^C
+```
+
+- 端末2(送信側)
+```bash
+# 一回目の送信
+$ ./send 
+[D] 送信プログラムの開始、socket()を実行
+[D] 1番目のフレーム(受信予定)を送る準備をします
+[D] 1番目のフレーム(受信予定)を送りました
+[D] 2番目のフレーム(受信させない)を送る準備をします
+[D] 2番目のフレーム(受信させない)を送りました
+[D] 3番目のフレーム(受信させない)を送る準備をします
+[D] 3番目のフレーム(受信させない)を送りました
+[D] ソケットを閉じて終了します
+# 二回目の送信
+$ ./send 
+[D] 送信プログラムの開始、socket()を実行
+[D] 1番目のフレーム(受信予定)を送る準備をします
+[D] 1番目のフレーム(受信予定)を送りました
+[D] 2番目のフレーム(受信させない)を送る準備をします
+[D] 2番目のフレーム(受信させない)を送りました
+[D] 3番目のフレーム(受信させない)を送る準備をします
+[D] 3番目のフレーム(受信させない)を送りました
+[D] ソケットを閉じて終了します
+```
+- 2番目(can idを変更)と3番目(標準から拡張フレームに変更)が届かないことが確認できた
+  - これによってフィルタ機能が働いていることが確認できた
+
+
+### 感想
+- ビット論理積によってフラグを判定したりフィルタリングするのはIPパケットでやったので理解がしやすかった。
+- 今回はctrl+cでの強制終了で終わるようにしたが、、今度はctrl+cでループを抜けて今回到達しなかった
+  終了処理を実行できるようにしたい。
+
 ## 第3回 送信テスト 2026-06-08
 ### 学習内容
 - 送信プログラムの作成

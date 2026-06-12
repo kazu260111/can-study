@@ -19,6 +19,7 @@
 #include <stdint.h>
 #define ERROR_WRITE 2
 #define ERROR_BYTE_COUNT 3
+
 void error_print(int err_num, ssize_t num_write) {
 	if (err_num == ERROR_WRITE) {
 		fprintf(stderr, "[E] write()に失敗しました: %s\n", strerror(errno));
@@ -43,6 +44,13 @@ int send_frame(int s, struct can_frame *ptr_frame) {
 		return 1;
 	}
 	return 0;
+}
+int send_sensor_data(int s, canid_t can_id, struct sensor_data *ptr_data) {
+	struct can_frame frame = {0};
+	frame.can_id = can_id;
+	frame.len = sizeof(*ptr_data);
+	memcpy(frame.data, ptr_data, sizeof(*ptr_data));
+	return send_frame(s, &frame);
 }
 
 int main() {
@@ -78,26 +86,13 @@ int main() {
 
 	/*>>> 1番目のフレーム(受信させる) <<<*/
 	fprintf(stderr, "[D] 1番目のフレーム(受信予定)を送る準備をします\n");
-	/* 0で初期化(使わない領域を確実に0で埋めておく) */
-	struct can_frame frame = {0};
-	/* can_idの設定 */
-	frame.can_id = 0x123;
-	/* データの長さの設定 */
-	frame.len = sizeof(struct sensor_data);
-	/* ペイロードに入れるデータの設定 */
-	/* ホストがリトルエンディアンなのでこのまま設定してよい */
 	struct sensor_data data;
-	data.temperature = 25;  /* 1byte */
-	data.humidity = 50;  /* 1byte */
-	data.pressure = 1013;  /* 2byte */
-	data.timestamp = 0x1234ABCD;  /* 4byte */
-	/* frameにデータを入れる */
-	/* リトルエンディアンで統一されていて、構造体にパディングもないのでこのままmemcpy()でよい */
-	memcpy(frame.data, &data, sizeof(data));
-
-	/*>>> フレームの送信 <<<*/
-	int rt = send_frame(s, &frame);
-	if (rt == 1) {
+	data.temperature = 10;  /* 1byte */
+	data.humidity = 10;  /* 1byte */
+	data.pressure = 1010;  /* 2byte */
+	data.timestamp = 0x1;  /* 4byte */
+	int rt = send_sensor_data(s, 0x123, &data); 
+	if (rt != 0) {
 		close(s);
 		return 1;
 	}
@@ -106,21 +101,14 @@ int main() {
 	/*>>> 2番目のフレーム(受信させない) <<<*/
 	fprintf(stderr, "[D] 2番目のフレーム(受信させない)を送る準備をします\n");
 	/* 0でリセット*/
-	memset(&frame, 0, sizeof(struct can_frame));
-	/*=== can_idの設定(別のcan id) ===*/
-	frame.can_id = 0x456;
-	/* データの長さの設定 */
-	frame.len = sizeof(struct sensor_data);
-	/* ペイロードに入れるデータの設定 */
-	data.temperature = 10;  /* 1byte */
-	data.humidity = 10;  /* 1byte */
-	data.pressure = 1000;  /* 2byte */
-	data.timestamp = 0x1;  /* 4byte */
-	/* frameにデータを入れる */
-	memcpy(frame.data, &data, sizeof(data));
-	/*>>> フレームの送信 <<<*/
-	rt = send_frame(s, &frame);
-	if (rt == 1) {
+	memset(&data, 0, sizeof(data));
+	data.temperature = 20;  /* 1byte */
+	data.humidity = 20;  /* 1byte */
+	data.pressure = 1020;  /* 2byte */
+	data.timestamp = 0x2;  /* 4byte */
+	/* can idを変更(届かなくなるはず) */
+	rt = send_sensor_data(s, 0x456, &data); 
+	if (rt != 0) {
 		close(s);
 		return 1;
 	}
@@ -129,22 +117,14 @@ int main() {
 	/*>>> 3番目のフレーム(受信させない) <<<*/
 	fprintf(stderr, "[D] 3番目のフレーム(受信させない)を送る準備をします\n");
 	/* 0でリセット*/
-	memset(&frame, 0, sizeof(struct can_frame));
-	/*=== can_idの設定(拡張フォーマット) ===*/
-	frame.can_id = 0x123 | CAN_EFF_FLAG;
-
-	/* データの長さの設定 */
-	frame.len = sizeof(struct sensor_data);
-	/* ペイロードに入れるデータの設定 */
-	data.temperature = 10;  /* 1byte */
-	data.humidity = 10;  /* 1byte */
-	data.pressure = 1000;  /* 2byte */
-	data.timestamp = 0x1;  /* 4byte */
-	/* frameにデータを入れる */
-	memcpy(frame.data, &data, sizeof(data));
-	/*>>> フレームの送信 <<<*/
-	rt = send_frame(s, &frame);
-	if (rt == 1) {
+	memset(&data, 0, sizeof(data));
+	data.temperature = 30;  /* 1byte */
+	data.humidity = 30;  /* 1byte */
+	data.pressure = 1030;  /* 2byte */
+	data.timestamp = 0x3;  /* 4byte */
+	/* 拡張フラグをセット(届かなくなるはず) */
+	rt = send_sensor_data(s, 0x123 | CAN_EFF_FLAG, &data); 
+	if (rt != 0) {
 		close(s);
 		return 1;
 	}

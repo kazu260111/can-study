@@ -1,5 +1,8 @@
 /*
  * 生の仮想CANフレームを受信するプログラム
+ *
+ * 更新履歴:
+ * 第4回 フィルタを設定するコードを追加、複数フレームをループで受信するがctrl+cで強制終了する必要がある
  * 
  * ソケットを開けてから受信までの処理はほぼ学習メモ第1回の内容通り。
  * それに加えて読んだフレームを独自の構造体にキャストして意味のあるデータとして
@@ -9,6 +12,7 @@
  */
 
 #include <linux/can.h>
+#include <linux/can/raw.h> 
 #include <linux/sockios.h>
 #include <stdio.h>
 #include <errno.h>
@@ -50,40 +54,54 @@ int main() {
 		close(s);
 		return 1;
 	}
-	/* read()の実行 */
-	struct can_frame frame;
-	ssize_t num_read = read(s, &frame, sizeof(struct can_frame));
-	/* read()で読み取れなかったとき */
-	if (num_read < 0) {
-		fprintf(stderr, "[E] read()でフレームを読み取れませんでした: %s\n", strerror(errno));
+	/* フィルタの設定 */
+	struct can_filter rfilter;
+	rfilter.can_id = 0x123;
+	rfilter.can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;	/* 標準フレームのみ通すようにに設定 */
+	/* フィルタ設定の実行 */
+	if (setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter)) == -1) {
+		fprintf(stderr, "setsockopt()に失敗: %s\n", strerror(errno));
 		close(s);
 		return 1;
 	}
-	/* 規定の16byteを読み取れないとき */
-	if (num_read < (ssize_t)sizeof(struct can_frame)) {
-	       fprintf(stderr, "[E] 読み取れたフレームが規定(16バイト)より少ないです \n");
-	       close(s);
-	       return 1;
- 	}
-	fprintf(stderr, "[D] フレームの読み取りが完了しました\n");	
+		
+	/*>>> 受信(エラーにならない限りループ) <<<*/
+	while (1) {
+		/* read()の実行 */
+		struct can_frame frame;
+		ssize_t num_read = read(s, &frame, sizeof(struct can_frame));
+		/* read()で読み取れなかったとき */
+		if (num_read < 0) {
+			fprintf(stderr, "[E] read()でフレームを読み取れませんでした: %s\n", strerror(errno));
+			close(s);
+			return 1;
+		}
+		/* 規定の16byteを読み取れないとき */
+		if (num_read < (ssize_t)sizeof(struct can_frame)) {
+		       fprintf(stderr, "[E] 読み取れたフレームが規定(16バイト)より少ないです \n");
+		       close(s);
+		       return 1;
+	 	}
+		fprintf(stderr, "[D] フレームの読み取りが完了しました\n");	
+	
+		/*>>> フレームの解釈とデータ表示 <<<*/
+		fprintf(stderr, "[D] フレームの解釈を開始します\n");
+		struct sensor_data data;
+		/* フレームのペイロードをsensor_data型の変数に入れる */
+		memcpy(&data, frame.data, sizeof(data));
+		fprintf(stderr, "[D] 受け取ったデータを表示します\n");
+		/* 受け取ったデータの表示開始 */
+		printf("温度: %d °C\n"
+		       "湿度: %u %%\n"
+		       "気圧: %u hPa\n"
+		       "送信時刻: %u ms\n",
+		       data.temperature,
+		       data.humidity,
+		       data.pressure,
+		       data.timestamp);
+	}
 
-	/*>>> フレームの解釈とデータ表示 <<<*/
-	fprintf(stderr, "[D] フレームの解釈を開始します\n");
-	struct sensor_data data;
-	/* フレームのペイロードをsensor_data型の変数に入れる */
-	memcpy(&data, frame.data, sizeof(data));
-	fprintf(stderr, "[D] 受け取ったデータを表示します\n");
-	/* 受け取ったデータの表示開始 */
-	printf("温度: %d °C\n"
-	       "湿度: %u %%\n"
-	       "気圧: %u hPa\n"
-	       "送信時刻: %u ms\n",
-	       data.temperature,
-	       data.humidity,
-	       data.pressure,
-	       data.timestamp);
-
-	/*>>> 終了処理 <<<*/
+	/*>>> 終了処理(到達しない) <<<*/
 	fprintf(stderr, "[D] ソケットを閉じて終了します\n");
 	close(s);
 	return 0;
